@@ -16,6 +16,8 @@ jobs:
           python-version: "3.12"
       - run: pip install ruff
       - run: ruff check clawteam/ tests/
+      - name: Validate PEFY production qualification script
+        run: bash -n scripts/verify-pefy-production.sh
 
   test:
     runs-on: ${{ matrix.os }}
