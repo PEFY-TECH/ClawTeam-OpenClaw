@@ -53,15 +53,15 @@ ok "tmux found: $(tmux -V)"
 
 # ─── 3. Check openclaw ───────────────────────────────────────────────────────
 info "Checking openclaw..."
-if ! command -v openclaw &>/dev/null; then
-    if python3 -m openclaw --version &>/dev/null 2>&1; then
-        ok "openclaw available via python3 -m openclaw."
-    else
-        fail "openclaw is not installed. Install it first: pip install openclaw"
-    fi
+OPENCLAW_CMD=()
+if command -v openclaw &>/dev/null; then
+    OPENCLAW_CMD=(openclaw)
+elif python3 -m openclaw --version &>/dev/null 2>&1; then
+    OPENCLAW_CMD=(python3 -m openclaw)
 else
-    ok "openclaw found: $(openclaw --version 2>/dev/null || echo 'installed')"
+    fail "openclaw is not installed. Install it first: pip install openclaw"
 fi
+ok "openclaw found: $("${OPENCLAW_CMD[@]}" --version 2>/dev/null || echo 'installed')"
 
 # ─── 4. Install clawteam ─────────────────────────────────────────────────────
 info "Installing clawteam..."
@@ -123,6 +123,13 @@ if [[ -z "$CLAWTEAM_BIN" ]]; then
 fi
 ok "clawteam binary found at: $CLAWTEAM_BIN"
 
+CLAWTEAM_RESOLVED="$(python3 - "$CLAWTEAM_BIN" <<'PY'
+from pathlib import Path
+import sys
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+
 # ─── 6. Create symlink at ~/bin/clawteam ──────────────────────────────────────
 info "Setting up ~/bin/clawteam symlink..."
 mkdir -p "$HOME/bin"
@@ -170,32 +177,52 @@ fi
 
 # ─── 9. Configure exec approvals ─────────────────────────────────────────────
 info "Configuring exec approvals for ClawTeam..."
-APPROVALS_FILE="$HOME/.openclaw/exec-approvals.json"
-if [[ -f "$APPROVALS_FILE" ]]; then
-    # Ensure security is "allowlist" (not "full") so spawned agents don't get
-    # stuck on interactive permission prompts when running clawteam commands.
-    CURRENT_SECURITY=$(python3 -c "import json; d=json.load(open('$APPROVALS_FILE')); print(d.get('defaults',{}).get('security',''))" 2>/dev/null || echo "")
-    if [[ "$CURRENT_SECURITY" == "full" ]]; then
-        python3 -c "
-import json
-with open('$APPROVALS_FILE') as f:
-    d = json.load(f)
-d['defaults']['security'] = 'allowlist'
-with open('$APPROVALS_FILE', 'w') as f:
-    json.dump(d, f, indent=2)
-" 2>/dev/null
-        ok "Exec approvals security: full -> allowlist (prevents spawned agents from blocking on permission prompts)"
-    else
-        ok "Exec approvals security already: ${CURRENT_SECURITY:-default}"
-    fi
-    # Add clawteam to the allowlist for all agents
-    if command -v openclaw &>/dev/null; then
-        openclaw approvals allowlist add --agent "*" "*/clawteam" &>/dev/null 2>&1 && \
-            ok "Added clawteam to exec approvals allowlist" || \
-            warn "Could not add clawteam to allowlist (gateway may not be running)"
-    fi
+REQUIRED_AGENTS="${PEFY_OPENCLAW_AGENT_IDS:-main}"
+
+# Prefer the current normalized OpenClaw policy surface. Fall back to the legacy
+# approvals file only when the installed OpenClaw does not support tools.exec.mode.
+if "${OPENCLAW_CMD[@]}" config set tools.exec.mode allowlist &>/dev/null; then
+    ok "OpenClaw requested exec mode set to allowlist"
 else
-    warn "exec-approvals.json not found — run openclaw once first, then re-run this script"
+    STATE_ROOT="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+    APPROVALS_FILE="$STATE_ROOT/exec-approvals.json"
+    if [[ -f "$APPROVALS_FILE" ]]; then
+        python3 - "$APPROVALS_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+data.setdefault("defaults", {})["security"] = "allowlist"
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+        ok "Legacy exec approvals security set to allowlist"
+    else
+        warn "Could not set tools.exec.mode and no legacy exec-approvals.json was found"
+    fi
+fi
+
+APPROVALS_FAILED=0
+IFS=',' read -r -a AGENT_IDS <<< "$REQUIRED_AGENTS"
+for RAW_AGENT_ID in "${AGENT_IDS[@]}"; do
+    AGENT_ID="$(printf '%s' "$RAW_AGENT_ID" | xargs)"
+    [[ -n "$AGENT_ID" ]] || continue
+    if [[ "$AGENT_ID" == "*" ]]; then
+        warn "Wildcard agent '*' is not accepted for PEFY production qualification; name concrete agents instead"
+        APPROVALS_FAILED=1
+        continue
+    fi
+    if "${OPENCLAW_CMD[@]}" approvals allowlist add --agent "$AGENT_ID" "$CLAWTEAM_RESOLVED" &>/dev/null; then
+        ok "Allowlisted ClawTeam for OpenClaw agent: $AGENT_ID"
+    else
+        warn "Could not add ClawTeam to the allowlist for agent $AGENT_ID"
+        APPROVALS_FAILED=1
+    fi
+done
+
+if [[ "$APPROVALS_FAILED" -ne 0 ]]; then
+    fail "OpenClaw approvals configuration is incomplete"
 fi
 
 # ─── 10. Verify clawteam --version ───────────────────────────────────────────
@@ -204,10 +231,21 @@ if "$CLAWTEAM_BIN" --version &>/dev/null; then
     CT_VERSION="$("$CLAWTEAM_BIN" --version 2>&1)"
     ok "clawteam --version: $CT_VERSION"
 else
-    warn "clawteam --version did not return cleanly, but the binary exists."
+    fail "clawteam --version did not return cleanly"
 fi
 
-# ─── 11. Success ─────────────────────────────────────────────────────────────
+# ─── 11. Run production qualification ────────────────────────────────────────
+QUALIFIER="$REPO_ROOT/scripts/verify-pefy-production.sh"
+if [[ -f "$QUALIFIER" ]]; then
+    info "Running PEFY production qualification..."
+    PEFY_OPENCLAW_AGENT_IDS="$REQUIRED_AGENTS" bash "$QUALIFIER" || \
+        fail "PEFY production qualification failed"
+    ok "PEFY production qualification passed"
+else
+    warn "Production qualifier not found at $QUALIFIER"
+fi
+
+# ─── 12. Success ──────────────────────────────────────────────────────────────
 echo ""
 printf "${BOLD}${GREEN}"
 cat << 'MSG'
