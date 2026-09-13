@@ -102,10 +102,11 @@ def _healthy() -> dict:
 def _approved() -> dict:
     return {
         "version": 1,
-        "defaults": {"security": "allowlist"},
+        "defaults": {"security": "deny", "ask": "on-miss"},
         "agents": {
             "main": {
                 "security": "allowlist",
+                "ask": "on-miss",
                 "allowlist": [{"pattern": "__CLAWTEAM_BIN__"}],
             }
         },
@@ -131,7 +132,7 @@ def test_production_qualification_fails_when_data_directory_is_unwritable(tmp_pa
 def test_production_qualification_requires_concrete_agent_clawteam_allowlist(tmp_path: Path) -> None:
     approvals = {
         "version": 1,
-        "defaults": {"security": "allowlist"},
+        "defaults": {"security": "allowlist", "ask": "on-miss"},
         "agents": {
             "*": {
                 "security": "allowlist",
@@ -145,3 +146,13 @@ def test_production_qualification_requires_concrete_agent_clawteam_allowlist(tmp
 
     assert result.returncode != 0
     assert "does not explicitly allow" in result.stderr
+
+
+def test_production_qualification_rejects_always_prompt_policy(tmp_path: Path) -> None:
+    approvals = _approved()
+    approvals["agents"]["main"]["ask"] = "always"
+
+    result = _run_qualification(tmp_path, health=_healthy(), approvals=approvals)
+
+    assert result.returncode != 0
+    assert "would block on prompts" in result.stderr
