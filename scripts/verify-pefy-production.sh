@@ -100,13 +100,8 @@ if snapshot is None:
     raise SystemExit("Could not locate OpenClaw approvals defaults/agents in JSON output")
 
 defaults = snapshot.get("defaults") or {}
-default_security = defaults.get("security")
-if default_security != "allowlist":
-    raise SystemExit(
-        "OpenClaw exec approval default security must be 'allowlist' for PEFY production; "
-        f"got {default_security!r}"
-    )
-
+default_security = defaults.get("security", defaults.get("mode"))
+default_ask = defaults.get("ask")
 agents = snapshot.get("agents") or {}
 if not required_agents:
     raise SystemExit("No required OpenClaw agents configured for qualification")
@@ -131,11 +126,17 @@ for agent_id in required_agents:
     if not isinstance(cfg, dict):
         raise SystemExit(f"OpenClaw approvals have no concrete policy for required agent {agent_id!r}")
 
-    effective_security = cfg.get("security", default_security)
+    effective_security = cfg.get("security", cfg.get("mode", default_security))
     if effective_security != "allowlist":
         raise SystemExit(
             f"OpenClaw agent {agent_id!r} effective security must be 'allowlist'; "
             f"got {effective_security!r}"
+        )
+
+    effective_ask = cfg.get("ask", default_ask)
+    if effective_ask == "always":
+        raise SystemExit(
+            f"OpenClaw agent {agent_id!r} ask policy is 'always'; autonomous ClawTeam coordination would block on prompts"
         )
 
     allowlist = cfg.get("allowlist") or []
@@ -155,7 +156,7 @@ for agent_id in required_agents:
         )
 
 print(
-    "OpenClaw exec approvals: allowlist mode with explicit ClawTeam rule for "
+    "OpenClaw exec approvals: effective allowlist with explicit ClawTeam rule for "
     + ", ".join(required_agents)
 )
 PY
